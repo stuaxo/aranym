@@ -1655,5 +1655,168 @@ void check_event()
 	}
 }
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <emscripten/threading.h>
+
+/* Web (Emscripten) input injection.
+ *
+ * Under -s PROXY_TO_PTHREAD=1, main()/check_event() runs on a proxied
+ * pthread worker, but the browser fires DOM input events on the real
+ * main thread. Emscripten's SDL2 port is supposed to forward those
+ * automatically via its "_on_thread" callbacks, but in practice they
+ * never reach SDL_PollEvent() here. These functions let JS push a
+ * synthetic SDL_Event onto the worker thread directly instead, via
+ * emscripten_dispatch_to_thread_async(), so it's picked up by the
+ * normal check_event() loop above as if the bridge had worked. All the
+ * existing scancode/mouse-packet handling in process_keyboard_event()/
+ * process_mouse_event() is reused unchanged.
+ */
+
+static void web_do_inject_mouse_motion(int xrel, int yrel)
+{
+	SDL_Event event;
+	SDL_zero(event);
+	event.type = SDL_MOUSEMOTION;
+	event.motion.timestamp = SDL_GetTicks();
+	event.motion.windowID = (host && host->video) ? host->video->window_id : 0;
+	event.motion.xrel = xrel;
+	event.motion.yrel = yrel;
+	SDL_PushEvent(&event);
+}
+
+static void web_do_inject_mouse_button(int button, int down)
+{
+	SDL_Event event;
+	SDL_zero(event);
+	event.type = down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
+	event.button.timestamp = SDL_GetTicks();
+	event.button.windowID = (host && host->video) ? host->video->window_id : 0;
+	event.button.button = (Uint8)button;
+	event.button.state = down ? SDL_PRESSED : SDL_RELEASED;
+	event.button.clicks = 1;
+	SDL_PushEvent(&event);
+}
+
+static void web_do_inject_key(int scancode, int down)
+{
+	SDL_Event event;
+	SDL_zero(event);
+	event.type = down ? SDL_KEYDOWN : SDL_KEYUP;
+	event.key.timestamp = SDL_GetTicks();
+	event.key.windowID = (host && host->video) ? host->video->window_id : 0;
+	event.key.state = down ? SDL_PRESSED : SDL_RELEASED;
+	event.key.repeat = 0;
+	event.key.keysym.scancode = (SDL_Scancode)scancode;
+	event.key.keysym.sym = SDL_GetKeyFromScancode((SDL_Scancode)scancode);
+	event.key.keysym.mod = SDL_GetModState();
+	SDL_PushEvent(&event);
+}
+
+static void web_do_set_grabbed(int grabbed)
+{
+	/* Sets HostScreen's grabbedMouse flag directly -- process_mouse_event()
+	 * requires it before acting on any motion/button event, whether or
+	 * not the SDL_SetWindowGrab()/Pointer-Lock request inside grabMouse()
+	 * is actually granted. A real Pointer Lock grant, if wanted, still
+	 * has to be requested separately from JS inside an actual user
+	 * gesture, since that's a browser security requirement this
+	 * asynchronously-dispatched call can't satisfy on its own.
+	 */
+	grabMouse(grabbed ? SDL_TRUE : SDL_FALSE);
+}
+
+/* Last position injected via web_inject_abs_mouse_position(), kept
+ * private on purpose. ARADATA::mouse_x/y (via getAtariMouseX()/Y()/
+ * setAtariMousePosition()) looks like the natural shared state for
+ * this -- it's exactly what process_mouse_event()'s __ANDROID__ branch
+ * already uses for the same kind of delta derivation from absolute
+ * input -- but isAtariMouseDriver() is already true on a real EmuTOS
+ * boot before this code ever runs, meaning something else (fVDI's
+ * host-cursor sync, most likely, via the NF_Config abase mechanism) is
+ * already reading and writing it too. Sharing it produced a visible
+ * cursor flicker: the delta was sometimes computed against a stale
+ * position written by that other consumer instead of our own last one.
+ * Plain static state here has no other writer to race against.
+ */
+static int s_last_abs_x = -1;
+static int s_last_abs_y = -1;
+
+static void web_do_inject_abs_mouse_position(int x, int y)
+{
+	if (host == NULL || host->video == NULL)
+		return;
+
+	int width = host->video->getWidth();
+	int height = host->video->getHeight();
+	int sx = (x * (width - 1)) / 0xFFFF;
+	int sy = (y * (height - 1)) / 0xFFFF;
+
+	if (s_last_abs_x == -1 && s_last_abs_y == -1) {
+		/* First call ever: prime it instead of sending a huge bogus
+		 * delta against the initial sentinel. */
+		s_last_abs_x = sx;
+		s_last_abs_y = sy;
+		return;
+	}
+
+	int xrel = sx - s_last_abs_x;
+	int yrel = sy - s_last_abs_y;
+	s_last_abs_x = sx;
+	s_last_abs_y = sy;
+
+	if (xrel == 0 && yrel == 0)
+		return;
+
+	SDL_Event event;
+	SDL_zero(event);
+	event.type = SDL_MOUSEMOTION;
+	event.motion.timestamp = SDL_GetTicks();
+	event.motion.windowID = host->video->window_id;
+	event.motion.xrel = xrel;
+	event.motion.yrel = yrel;
+	SDL_PushEvent(&event);
+}
+
+extern "C" {
+
+EMSCRIPTEN_KEEPALIVE
+void web_inject_mouse_motion(int xrel, int yrel)
+{
+	emscripten_dispatch_to_thread_async(emscripten_main_runtime_thread_id(),
+		EM_FUNC_SIG_VII, (void*)web_do_inject_mouse_motion, NULL, xrel, yrel);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void web_inject_mouse_button(int button, int down)
+{
+	emscripten_dispatch_to_thread_async(emscripten_main_runtime_thread_id(),
+		EM_FUNC_SIG_VII, (void*)web_do_inject_mouse_button, NULL, button, down);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void web_inject_key(int scancode, int down)
+{
+	emscripten_dispatch_to_thread_async(emscripten_main_runtime_thread_id(),
+		EM_FUNC_SIG_VII, (void*)web_do_inject_key, NULL, scancode, down);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void web_set_grabbed(int grabbed)
+{
+	emscripten_dispatch_to_thread_async(emscripten_main_runtime_thread_id(),
+		EM_FUNC_SIG_VI, (void*)web_do_set_grabbed, NULL, grabbed);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void web_inject_abs_mouse_position(int x, int y)
+{
+	emscripten_dispatch_to_thread_async(emscripten_main_runtime_thread_id(),
+		EM_FUNC_SIG_VII, (void*)web_do_inject_abs_mouse_position, NULL, x, y);
+}
+
+} // extern "C"
+#endif /* __EMSCRIPTEN__ */
+
 // don't remove this modeline with intended formatting for vim:ts=4:sw=4:
 
