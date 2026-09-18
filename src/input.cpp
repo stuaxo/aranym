@@ -1742,6 +1742,24 @@ static void web_do_set_grabbed(int grabbed)
 static int s_last_abs_x = -1;
 static int s_last_abs_y = -1;
 
+/* Set via web_set_abs_mouse_debug() -- lets JS ask this function to report
+ * what it actually computed (host video-pixel space, and the SDL relative
+ * delta it queued), as opposed to the guest 0..0xFFFF-space numbers JS
+ * already knows on its own side. Useful as a second, independent data
+ * point when checking the whole client-pixel -> ... -> IKBD pipeline, not
+ * just JS's half of it. Printed to stderr, which already flows to the
+ * host's own debug output (see debugprintf.cpp) and from there to the
+ * page's GEM/TOS debug log panel. Rate-limited: a raw mousemove rate would
+ * otherwise flood a log meant for occasional kernel/app messages.
+ */
+static bool s_abs_mouse_debug = false;
+static Uint32 s_last_abs_mouse_debug_print = 0;
+
+static void web_do_set_abs_mouse_debug(int enabled)
+{
+	s_abs_mouse_debug = enabled != 0;
+}
+
 static void web_do_inject_abs_mouse_position(int x, int y)
 {
 	if (host == NULL || host->video == NULL)
@@ -1767,6 +1785,17 @@ static void web_do_inject_abs_mouse_position(int x, int y)
 
 	if (xrel == 0 && yrel == 0)
 		return;
+
+	if (s_abs_mouse_debug) {
+		Uint32 now = SDL_GetTicks();
+		if (now - s_last_abs_mouse_debug_print >= 200) {
+			s_last_abs_mouse_debug_print = now;
+			fprintf(stderr,
+				"[mouse-debug] in=(%d,%d) video=%dx%d scaled=(%d,%d) rel=(%d,%d)\n",
+				x, y, width, height, sx, sy, xrel, yrel);
+			fflush(stderr);
+		}
+	}
 
 	SDL_Event event;
 	SDL_zero(event);
@@ -1813,6 +1842,13 @@ void web_inject_abs_mouse_position(int x, int y)
 {
 	emscripten_dispatch_to_thread_async(emscripten_main_runtime_thread_id(),
 		EM_FUNC_SIG_VII, (void*)web_do_inject_abs_mouse_position, NULL, x, y);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void web_set_abs_mouse_debug(int enabled)
+{
+	emscripten_dispatch_to_thread_async(emscripten_main_runtime_thread_id(),
+		EM_FUNC_SIG_VI, (void*)web_do_set_abs_mouse_debug, NULL, enabled);
 }
 
 } // extern "C"
