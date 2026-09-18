@@ -1802,6 +1802,24 @@ static void web_do_inject_abs_mouse_position(int x, int y)
 	event.type = SDL_MOUSEMOTION;
 	event.motion.timestamp = SDL_GetTicks();
 	event.motion.windowID = host->video->window_id;
+	/* process_mouse_event() (this file) reads the absolute x/y fields for
+	 * two things unrelated to the xrel/yrel-driven IKBD motion below: its
+	 * "is the mouse trying to leave the window" edge heuristic, and (with
+	 * NFVDI_SUPPORT/fVDI active, as AFROS uses) an absolute position it
+	 * dispatches straight to fVDI. Leaving these at SDL_zero()'s default
+	 * 0 -- as this event used to -- makes both misread every event as
+	 * "mouse is sitting in the top-left corner": the edge heuristic then
+	 * treats nearly any leftward/upward move as an exit attempt and
+	 * ungrabs the mouse (video->releaseTheMouse(), called from
+	 * check_event() below), after which process_mouse_event()'s
+	 * GrabbedMouse() gate silently drops all further motion -- the guest
+	 * cursor freezes while the (invisible, cursor:none) host pointer
+	 * keeps moving. fVDI's absolute dispatch gets fed the same bogus
+	 * (0,0) directly. Filling these in with the real scaled position
+	 * fixes both.
+	 */
+	event.motion.x = sx;
+	event.motion.y = sy;
 	event.motion.xrel = xrel;
 	event.motion.yrel = yrel;
 	SDL_PushEvent(&event);
