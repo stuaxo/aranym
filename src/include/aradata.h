@@ -38,6 +38,10 @@ public:
 	virtual uint8 handleRead(memptr addr);
 	virtual void handleWrite(memptr addr, uint8 value);
 	bool isAtariMouseDriver()	{ return abase != 0 || mouseDriver; }
+	// True once the guest has reported its line-A base, i.e. once
+	// getAtariMouseX()/Y() read the guest's live GCURX/GCURY rather
+	// than the fallback mouse_x/y fields.
+	bool hasLineA()	{ return abase != 0; }
 	int getAtariMouseX();
 	int getAtariMouseY();
 	void setAtariMousePosition(int x, int y);

@@ -1657,6 +1657,7 @@ void check_event()
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#include <emscripten/html5.h>
 #include <emscripten/threading.h>
 
 /* Web (Emscripten) input injection.
@@ -1726,21 +1727,67 @@ static void web_do_set_grabbed(int grabbed)
 	grabMouse(grabbed ? SDL_TRUE : SDL_FALSE);
 }
 
-/* Last position injected via web_inject_abs_mouse_position(), kept
- * private on purpose. ARADATA::mouse_x/y (via getAtariMouseX()/Y()/
- * setAtariMousePosition()) looks like the natural shared state for
- * this -- it's exactly what process_mouse_event()'s __ANDROID__ branch
- * already uses for the same kind of delta derivation from absolute
- * input -- but isAtariMouseDriver() is already true on a real EmuTOS
- * boot before this code ever runs, meaning something else (fVDI's
- * host-cursor sync, most likely, via the NF_Config abase mechanism) is
- * already reading and writing it too. Sharing it produced a visible
- * cursor flicker: the delta was sometimes computed against a stale
- * position written by that other consumer instead of our own last one.
- * Plain static state here has no other writer to race against.
+/* Last position injected via web_inject_abs_mouse_position(), in host
+ * video pixels.
+ *
+ * Deltas are normally taken against this private state rather than the
+ * guest's own cursor position. ARADATA::getAtariMouseX()/Y() -- what
+ * process_mouse_event()'s __ANDROID__ branch uses -- reads the guest's
+ * line-A GCURX/GCURY once EmuTOS has reported its line-A base
+ * (nf_setlinea() -> NFCONFIG_LINEA), but that position lags behind
+ * whatever IKBD packets are still queued. Diffing every event against it
+ * mid-motion re-sends movement the guest hasn't consumed yet, producing
+ * a visible overshoot/flicker.
+ *
+ * Private deltas alone never converge, though: the guest cursor starts
+ * wherever the OS put it (EmuTOS: screen centre), not under the host
+ * pointer, and gets clamped at screen edges while the host pointer isn't
+ * -- so any offset is permanent. Hence the resync below: once no motion
+ * has been sent for WEB_ABS_RESYNC_IDLE_MS (the IKBD queue has drained,
+ * so GCURX/GCURY is current), the next delta is taken against the
+ * guest's real position instead, which lands the cursor exactly under the
+ * host pointer. JS re-sends the last position shortly after the pointer
+ * stops (see src/main.ts) so this happens without further movement.
  */
 static int s_last_abs_x = -1;
 static int s_last_abs_y = -1;
+static Uint32 s_last_abs_motion_ms = 0;
+#define WEB_ABS_RESYNC_IDLE_MS 100
+
+/* Size of ARAnyM's video surface when the canvas size was last checked
+ * against it (see web_check_canvas_matches_video()). */
+static int s_checked_video_w = -1;
+static int s_checked_video_h = -1;
+
+/* SDL's Emscripten backend resizes the canvas it finds via the selector
+ * "#canvas", independently of Module.canvas (which it draws to). If the
+ * embedding page's canvas doesn't match that selector, a guest resolution
+ * change (e.g. AFROS's fVDI switching to 800x608) silently fails to
+ * resize it: the picture is cropped and every absolute position is
+ * scaled against the wrong size. Checked once per video-size change, not
+ * per event -- emscripten_get_canvas_element_size() proxies synchronously
+ * to the browser main thread.
+ */
+static void web_check_canvas_matches_video(int width, int height)
+{
+	if (width == s_checked_video_w && height == s_checked_video_h)
+		return;
+	s_checked_video_w = width;
+	s_checked_video_h = height;
+
+	int cw = 0, ch = 0;
+	EMSCRIPTEN_RESULT res = emscripten_get_canvas_element_size("#canvas", &cw, &ch);
+	if (res != EMSCRIPTEN_RESULT_SUCCESS) {
+		fprintf(stderr, "[mouse] WARNING: no \"#canvas\" element (result %d) -- "
+			"SDL can't resize the page's canvas to the %dx%d video surface\n",
+			res, width, height);
+	} else if (cw != width || ch != height) {
+		fprintf(stderr, "[mouse] WARNING: canvas is %dx%d but video surface is %dx%d -- "
+			"display will be cropped/scaled and mouse positions offset\n",
+			cw, ch, width, height);
+	}
+	fflush(stderr);
+}
 
 /* Set via web_set_abs_mouse_debug() -- lets JS ask this function to report
  * what it actually computed (host video-pixel space, and the SDL relative
@@ -1770,31 +1817,48 @@ static void web_do_inject_abs_mouse_position(int x, int y)
 	int sx = (x * (width - 1)) / 0xFFFF;
 	int sy = (y * (height - 1)) / 0xFFFF;
 
-	if (s_last_abs_x == -1 && s_last_abs_y == -1) {
-		/* First call ever: prime it instead of sending a huge bogus
-		 * delta against the initial sentinel. */
+	web_check_canvas_matches_video(width, height);
+
+	Uint32 now = SDL_GetTicks();
+	ARADATA *ara = getARADATA();
+	bool guest_pos_known = ara != NULL && ara->hasLineA();
+	bool resync = guest_pos_known &&
+		(s_last_abs_x == -1 || now - s_last_abs_motion_ms >= WEB_ABS_RESYNC_IDLE_MS);
+
+	int xrel, yrel;
+	int gx = -1, gy = -1;
+	if (resync) {
+		/* Idle: the guest has consumed all queued motion, so its cursor
+		 * position is current -- correct any drift against it. */
+		gx = ara->getAtariMouseX();
+		gy = ara->getAtariMouseY();
+		xrel = sx - gx;
+		yrel = sy - gy;
+	} else if (s_last_abs_x == -1 && s_last_abs_y == -1) {
+		/* First call before the guest has a cursor to read: prime
+		 * instead of sending a huge bogus delta against the sentinel. */
 		s_last_abs_x = sx;
 		s_last_abs_y = sy;
 		return;
+	} else {
+		xrel = sx - s_last_abs_x;
+		yrel = sy - s_last_abs_y;
 	}
-
-	int xrel = sx - s_last_abs_x;
-	int yrel = sy - s_last_abs_y;
 	s_last_abs_x = sx;
 	s_last_abs_y = sy;
 
 	if (xrel == 0 && yrel == 0)
 		return;
+	s_last_abs_motion_ms = now;
 
-	if (s_abs_mouse_debug) {
-		Uint32 now = SDL_GetTicks();
-		if (now - s_last_abs_mouse_debug_print >= 200) {
-			s_last_abs_mouse_debug_print = now;
-			fprintf(stderr,
-				"[mouse-debug] in=(%d,%d) video=%dx%d scaled=(%d,%d) rel=(%d,%d)\n",
-				x, y, width, height, sx, sy, xrel, yrel);
-			fflush(stderr);
-		}
+	if (s_abs_mouse_debug && (resync || now - s_last_abs_mouse_debug_print >= 200)) {
+		s_last_abs_mouse_debug_print = now;
+		fprintf(stderr,
+			"[mouse-debug] in=(%d,%d) video=%dx%d scaled=(%d,%d) rel=(%d,%d)%s",
+			x, y, width, height, sx, sy, xrel, yrel, resync ? "" : "\n");
+		if (resync)
+			fprintf(stderr, " resync: guest was at (%d,%d)\n", gx, gy);
+		fflush(stderr);
 	}
 
 	SDL_Event event;
