@@ -1,0 +1,210 @@
+ARAnyM for the web (Emscripten)
+===============================
+
+This branch builds ARAnyM to WebAssembly so it can run in a web browser.
+It has been tested booting EmuTOS and FreeMiNT (AFROS) with Emscripten 6.0.9,
+in Firefox and Chromium.
+
+This is a port in progress. It is not part of an ARAnyM release.
+
+
+What works
+----------
+
+- Booting EmuTOS, and FreeMiNT with fVDI and XaAES
+- Display, including guest resolution changes
+- Keyboard and mouse, using the input functions described below
+- Absolute mouse positioning, with no mouse grab needed
+
+What does not work
+------------------
+
+- Sound. SDL2's Emscripten audio driver fails when started off the main
+  thread, so the build uses the dummy driver.
+- The automatic SDL2 input bridge. Browser input events do not reach
+  SDL_PollEvent() under PROXY_TO_PTHREAD. The embedding page must send
+  input through the functions below instead.
+- Networking, host CD-ROM, USB, NatFeat exec and the X11 clipboard.
+  These are disabled at configure time.
+- JIT. The build uses the interpreter with normal addressing.
+
+
+Build requirements
+------------------
+
+- Emscripten SDK (emsdk), activated in the current shell
+- A native C compiler, for the build68k and gencpu host tools
+- autoconf and automake, to generate configure
+- An EmuTOS ROM image (etos1024k.img or similar)
+
+
+Building
+--------
+
+1. Generate configure without running it:
+
+       NO_CONFIGURE=1 ./autogen.sh
+
+   Running configure in the source directory breaks the out-of-tree build
+   in the next step.
+
+2. Configure in a separate build directory:
+
+       mkdir build-wasm && cd build-wasm
+       emconfigure ../configure --host=wasm32-unknown-none \
+         --disable-usbhost --disable-nfexec --disable-hostfs \
+         --disable-ata-cdrom --disable-ethernet --disable-nfclipbrd \
+         --enable-addressing=normal \
+         CFLAGS="-O2 -pthread" CXXFLAGS="-O2 -pthread"
+
+   Remove --disable-hostfs if you need a host file system drive.
+
+3. Generate sources that `make aranym` does not reach on its own:
+
+       make version_date.h
+       (cd src/uae_cpu && emmake make cpudefs.cpp cpuemu.cpp \
+         cpustbl.cpp cpufunctbl.cpp cputbl.h)
+
+4. Put the ROM and a config file in build-wasm/src, then link:
+
+       cd src
+       export EMCC_CFLAGS="-pthread -fwasm-exceptions \
+         -s ALLOW_MEMORY_GROWTH=1 -s INITIAL_MEMORY=134217728 \
+         -s USE_PTHREADS=1 -s PTHREAD_POOL_SIZE=8 -s PROXY_TO_PTHREAD=1 \
+         -s EXPORTED_RUNTIME_METHODS=ccall \
+         --preload-file emutos-aranym.img@/home/web_user/.aranym/emutos-aranym.img \
+         --preload-file aranym-config@/home/web_user/.aranym/config"
+       emmake make aranym
+
+   This produces aranym (the JavaScript loader), aranym.wasm and
+   aranym.data. Rename aranym to aranym.js if your server needs the
+   extension.
+
+Why these options are needed
+----------------------------
+
+--host=wasm32-unknown-none
+    The bundled config.sub does not recognise wasm32-unknown-emscripten.
+
+--enable-addressing=normal
+    Direct and fixed addressing need mmap(MAP_FIXED), which WebAssembly
+    does not have. configure picks direct addressing by default when
+    cross-compiling.
+
+-pthread, USE_PTHREADS, PROXY_TO_PTHREAD
+    SDL2 needs real threads for condition variables. ARAnyM's main loop
+    blocks, so main() must run on a worker thread. Every object must be
+    built with -pthread, so do a clean rebuild after changing it.
+
+-fwasm-exceptions
+    The 68k CPU emulation uses C++ exceptions. Emscripten turns them off
+    by default. ASYNCIFY cannot be used instead, as it does not support
+    WebAssembly exceptions.
+
+EXPORTED_RUNTIME_METHODS=ccall
+    Lets the page call the input functions.
+
+--preload-file .../config
+    If no config file exists, ARAnyM opens its setup screen instead of
+    booting. The file can be almost empty.
+
+EMCC_CFLAGS
+    Pass Emscripten options this way, not in CFLAGS or LDFLAGS. This keeps
+    them away from the native build68k and gencpu tools.
+
+
+Running in a page
+-----------------
+
+The page must be cross-origin isolated, because threads need
+SharedArrayBuffer. Serve it with these headers:
+
+    Cross-Origin-Opener-Policy: same-origin
+    Cross-Origin-Embedder-Policy: require-corp
+
+The page must contain a canvas with id="canvas". SDL resizes the canvas
+using that selector, but draws to Module.canvas. If they are different
+elements, resolution changes crop the display and mouse positions are
+wrong.
+
+Set up Module before loading aranym.js with a script tag:
+
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <script>
+      var Module = {
+        canvas: document.getElementById("canvas"),
+        arguments: ["-e"],   // boot EmuTOS
+        preRun: [function () { ENV.SDL_AUDIODRIVER = "dummy"; }],
+        locateFile: function (path) { return "/cores/aranym/" + path; },
+        onRuntimeInitialized: function () {
+          Module.ccall("web_set_grabbed", null, ["number"], [1]);
+        }
+      };
+    </script>
+    <script src="/cores/aranym/aranym.js"></script>
+
+Hide the browser pointer over the canvas (cursor: none) when using
+absolute mouse positioning, as the guest draws its own.
+
+
+Input functions
+---------------
+
+Call these from JavaScript with Module.ccall. Each one queues the event on
+ARAnyM's runtime thread and returns straight away.
+
+web_set_grabbed(grabbed)
+    Marks the mouse as grabbed (1) or released (0). ARAnyM ignores mouse
+    input while released. Call web_set_grabbed(1) once at start-up. No
+    pointer lock is needed.
+
+web_inject_abs_mouse_position(x, y)
+    Moves the guest mouse to an absolute position. x and y run from 0 to
+    65535 across the canvas, whatever its size. Send one call per
+    mousemove, and send the last position again about 150ms after the
+    pointer stops. See "How absolute positioning works".
+
+web_inject_mouse_motion(xrel, yrel)
+    Moves the guest mouse by a relative amount, in host pixels. Use this
+    with pointer lock instead of absolute positioning.
+
+web_inject_mouse_button(button, down)
+    Presses (1) or releases (0) a button: 1 left, 2 middle, 3 right.
+    Send the pointer position first.
+
+web_inject_key(scancode, down)
+    Presses (1) or releases (0) a key. scancode is an SDL_Scancode. These
+    follow USB HID usage numbers, as KeyboardEvent.code values do, so a
+    lookup table from code to scancode is enough. Keys ARAnyM does not map
+    are ignored.
+
+web_set_abs_mouse_debug(enabled)
+    Turns logging of absolute mouse handling to stderr on (1) or off (0).
+    For debugging only.
+
+
+How absolute positioning works
+------------------------------
+
+The IKBD absolute mouse commands are not implemented in ARAnyM, so
+web_inject_abs_mouse_position() sends relative IKBD movement instead.
+
+While the mouse is moving, it sends the change since the previous call.
+Once no movement has been sent for 100ms and the guest has read all
+queued movement, it sends the difference between the requested position
+and the guest's actual cursor position instead. This corrects any drift,
+for example from the guest cursor stopping at a screen edge. The guest's
+position is read from the line-A variables GCURX and GCURY, which EmuTOS
+reports at boot through NF_CONFIG.
+
+Comparing against the guest position on every call does not work: the
+guest position lags behind queued IKBD packets, so the cursor overshoots.
+
+Movement and button presses are queued and sent to the IKBD one packet
+at a time (at most 63 pixels per axis), each only once the guest has
+read the previous one. FreeMiNT with fVDI applies the second of two
+back-to-back mouse packets twice, so sending a large move as several
+packets at once makes the cursor overshoot.
+
+If the canvas size and ARAnyM's video size differ, a warning is written
+to stderr.

@@ -775,7 +775,7 @@ int32 VdiDriver::expandArea(memptr vwk, memptr src, int32 sx, int32 sy,
 	D(bug("fVDI: expandArea %x %d,%d:%d,%d:%d,%d (%x, %x)", logOp, sx, sy, dx, dy, w, h, fgColor, bgColor ));
 	D2(bug("fVDI: %s %x,%x : %x,%x", "expandArea - MFDB addresses", src, dest, ReadInt32(src + MFDB_ADDRESS),ReadInt32(dest + MFDB_ADDRESS)));
 	D2(bug("fVDI: %s %x, %d, %d", "expandArea - src: data address, MFDB wdwidth << 1, bitplanes", data, pitch, ReadInt16( src + MFDB_NPLANES )));
-	D2(bug("fVDI: %s %x, %d, %d", "expandArea - dst: data address, MFDB wdwidth << 1, bitplanes", destAdress, destPitch, mem_mfdb.planes));
+	D2(bug("fVDI: %s %x, %d, %d", "expandArea - dst: data address, MFDB wdwidth << 1, bitplanes", destAddress, destPitch, mem_mfdb.planes));
 
 	switch(mem_mfdb.planes)
 	{
