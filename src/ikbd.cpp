@@ -417,11 +417,11 @@ void IKBD::MergeMousePacket(int *relx, int *rely, int buttons)
 		return;
 
 	/* Check if distances are not too far */
-	distx = *relx + inbuffer[(mouse_inwrite+1) & (inbufferlen-1)];
+	distx = *relx + (int8)inbuffer[(mouse_inwrite+1) & (inbufferlen-1)];
 	if (abs(distx) > MOUSE_DELTA_MAX)
 		return;
 
-	disty = *rely + inbuffer[(mouse_inwrite+2) & (inbufferlen-1)];
+	disty = *rely + (int8)inbuffer[(mouse_inwrite+2) & (inbufferlen-1)];
 	if (abs(disty) > MOUSE_DELTA_MAX)
 		return;
 
