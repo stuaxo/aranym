@@ -1568,6 +1568,10 @@ static void process_joystick_event(const SDL_Event &event)
 ///////
 // main function for checking keyboard, mouse and joystick events
 // called from main.cpp every 20 ms
+#ifdef __EMSCRIPTEN__
+static void web_drain_mouse_queue(void);
+#endif
+
 void check_event()
 {
 	HostScreen *video;
@@ -1650,6 +1654,10 @@ void check_event()
 		}
 	}
 
+#ifdef __EMSCRIPTEN__
+	web_drain_mouse_queue();
+#endif
+
 	if (pendingQuit) {
 		Quit680x0();	// forces CPU to quit the loop
 	}
@@ -1686,7 +1694,14 @@ static void web_do_inject_mouse_motion(int xrel, int yrel)
 	SDL_PushEvent(&event);
 }
 
+static void web_queue_mouse_button(int button, int down);
+
 static void web_do_inject_mouse_button(int button, int down)
+{
+	web_queue_mouse_button(button, down);
+}
+
+static void web_push_mouse_button(int button, int down)
 {
 	SDL_Event event;
 	SDL_zero(event);
@@ -1743,16 +1758,141 @@ static void web_do_set_grabbed(int grabbed)
  * wherever the OS put it (EmuTOS: screen centre), not under the host
  * pointer, and gets clamped at screen edges while the host pointer isn't
  * -- so any offset is permanent. Hence the resync below: once no motion
- * has been sent for WEB_ABS_RESYNC_IDLE_MS (the IKBD queue has drained,
- * so GCURX/GCURY is current), the next delta is taken against the
+ * has been sent for WEB_ABS_RESYNC_IDLE_MS and the IKBD queue has
+ * drained (so GCURX/GCURY is current), the next delta is taken against the
  * guest's real position instead, which lands the cursor exactly under the
- * host pointer. JS re-sends the last position shortly after the pointer
- * stops (see src/main.ts) so this happens without further movement.
+ * host pointer. JS re-sends the last position a few times after the
+ * pointer stops (see src/main.ts) so this happens without further
+ * movement, even when the queue is slow to drain.
  */
 static int s_last_abs_x = -1;
 static int s_last_abs_y = -1;
 static Uint32 s_last_abs_motion_ms = 0;
 #define WEB_ABS_RESYNC_IDLE_MS 100
+
+/* Mouse input from web_inject_abs_mouse_position() and
+ * web_inject_mouse_button(), in arrival order, fed to the IKBD one
+ * packet at a time by web_drain_mouse_queue().
+ *
+ * FreeMiNT (with fVDI, as in AFROS) applies the second of two IKBD mouse
+ * packets queued back to back twice: a +99 pixel move, split by
+ * IKBD::SendMouseMotion() into packets of 63 and 36, moves the guest
+ * cursor 135 pixels. Fast pointer moves produce steps over 63 pixels,
+ * so the cursor overshoots. Only ever queuing one packet at a time, once
+ * the guest has read the previous one, avoids this. Buttons share the
+ * queue so a click lands after the motion before it. */
+#define WEB_MOUSE_DELTA_MAX 63
+#define WEB_MOUSE_QUEUE_LEN 32
+struct web_mouse_entry {
+	bool is_button;
+	int dx, dy;		/* motion still to send */
+	int button, down;
+};
+static web_mouse_entry s_web_mouse_queue[WEB_MOUSE_QUEUE_LEN];
+static int s_web_mouse_head = 0;
+static int s_web_mouse_count = 0;
+/* Latest absolute position, for the motion event's x/y fields */
+static int s_web_mouse_x = 0;
+static int s_web_mouse_y = 0;
+
+static web_mouse_entry *web_mouse_tail(void)
+{
+	if (s_web_mouse_count == 0)
+		return NULL;
+	return &s_web_mouse_queue[(s_web_mouse_head + s_web_mouse_count - 1) % WEB_MOUSE_QUEUE_LEN];
+}
+
+static web_mouse_entry *web_mouse_append(void)
+{
+	if (s_web_mouse_count == WEB_MOUSE_QUEUE_LEN)
+		return NULL;
+	web_mouse_entry *e = &s_web_mouse_queue[(s_web_mouse_head + s_web_mouse_count) % WEB_MOUSE_QUEUE_LEN];
+	s_web_mouse_count++;
+	SDL_zerop(e);
+	return e;
+}
+
+static void web_queue_mouse_motion(int dx, int dy)
+{
+	web_mouse_entry *e = web_mouse_tail();
+	if (e == NULL || e->is_button) {
+		web_mouse_entry *n = web_mouse_append();
+		/* Queue full (only if buttons pile up): add to the last entry
+		 * rather than lose the motion. */
+		if (n != NULL)
+			e = n;
+		else if (e == NULL)
+			return;
+	}
+	e->dx += dx;
+	e->dy += dy;
+}
+
+static void web_queue_mouse_button(int button, int down)
+{
+	web_mouse_entry *e = web_mouse_append();
+	if (e == NULL) {
+		/* Full: send now rather than drop it */
+		web_push_mouse_button(button, down);
+		return;
+	}
+	e->is_button = true;
+	e->button = button;
+	e->down = down;
+}
+
+static int web_clamp_delta(int d)
+{
+	if (d > WEB_MOUSE_DELTA_MAX)
+		return WEB_MOUSE_DELTA_MAX;
+	if (d < -WEB_MOUSE_DELTA_MAX)
+		return -WEB_MOUSE_DELTA_MAX;
+	return d;
+}
+
+/* Called from check_event() after its SDL_PollEvent() loop, so the event
+ * pushed here is turned into an IKBD packet on the next call, before
+ * this runs again and sees the queue non-empty. */
+static void web_drain_mouse_queue(void)
+{
+	if (s_web_mouse_count == 0 || host == NULL || host->video == NULL)
+		return;
+	if (!getIKBD()->IsInputBufferEmpty())
+		return;
+
+	web_mouse_entry *e = &s_web_mouse_queue[s_web_mouse_head];
+	if (e->is_button) {
+		web_push_mouse_button(e->button, e->down);
+		s_web_mouse_head = (s_web_mouse_head + 1) % WEB_MOUSE_QUEUE_LEN;
+		s_web_mouse_count--;
+		return;
+	}
+
+	int dx = web_clamp_delta(e->dx);
+	int dy = web_clamp_delta(e->dy);
+	e->dx -= dx;
+	e->dy -= dy;
+	if (e->dx == 0 && e->dy == 0) {
+		s_web_mouse_head = (s_web_mouse_head + 1) % WEB_MOUSE_QUEUE_LEN;
+		s_web_mouse_count--;
+	}
+	if (dx == 0 && dy == 0)
+		return;
+
+	SDL_Event event;
+	SDL_zero(event);
+	event.type = SDL_MOUSEMOTION;
+	event.motion.timestamp = SDL_GetTicks();
+	event.motion.windowID = host->video->window_id;
+	/* See web_do_inject_abs_mouse_position() for why x/y must be set */
+	event.motion.x = s_web_mouse_x;
+	event.motion.y = s_web_mouse_y;
+	event.motion.xrel = dx;
+	event.motion.yrel = dy;
+	SDL_PushEvent(&event);
+	/* Resync idles from the last packet sent, not the last queued */
+	s_last_abs_motion_ms = SDL_GetTicks();
+}
 
 /* Size of ARAnyM's video surface when the canvas size was last checked
  * against it (see web_check_canvas_matches_video()). */
@@ -1822,7 +1962,11 @@ static void web_do_inject_abs_mouse_position(int x, int y)
 	Uint32 now = SDL_GetTicks();
 	ARADATA *ara = getARADATA();
 	bool guest_pos_known = ara != NULL && ara->hasLineA();
-	bool resync = guest_pos_known &&
+	/* The guest must also have read all queued motion, ours and the
+	 * IKBD's: correcting against a stale position overshoots once the
+	 * queued motion lands. */
+	bool resync = guest_pos_known && s_web_mouse_count == 0 &&
+		getIKBD()->IsInputBufferEmpty() &&
 		(s_last_abs_x == -1 || now - s_last_abs_motion_ms >= WEB_ABS_RESYNC_IDLE_MS);
 
 	int xrel, yrel;
@@ -1861,32 +2005,21 @@ static void web_do_inject_abs_mouse_position(int x, int y)
 		fflush(stderr);
 	}
 
-	SDL_Event event;
-	SDL_zero(event);
-	event.type = SDL_MOUSEMOTION;
-	event.motion.timestamp = SDL_GetTicks();
-	event.motion.windowID = host->video->window_id;
-	/* process_mouse_event() (this file) reads the absolute x/y fields for
-	 * two things unrelated to the xrel/yrel-driven IKBD motion below: its
-	 * "is the mouse trying to leave the window" edge heuristic, and (with
-	 * NFVDI_SUPPORT/fVDI active, as AFROS uses) an absolute position it
-	 * dispatches straight to fVDI. Leaving these at SDL_zero()'s default
-	 * 0 -- as this event used to -- makes both misread every event as
-	 * "mouse is sitting in the top-left corner": the edge heuristic then
-	 * treats nearly any leftward/upward move as an exit attempt and
-	 * ungrabs the mouse (video->releaseTheMouse(), called from
-	 * check_event() below), after which process_mouse_event()'s
-	 * GrabbedMouse() gate silently drops all further motion -- the guest
-	 * cursor freezes while the (invisible, cursor:none) host pointer
-	 * keeps moving. fVDI's absolute dispatch gets fed the same bogus
-	 * (0,0) directly. Filling these in with the real scaled position
-	 * fixes both.
-	 */
-	event.motion.x = sx;
-	event.motion.y = sy;
-	event.motion.xrel = xrel;
-	event.motion.yrel = yrel;
-	SDL_PushEvent(&event);
+	/* process_mouse_event() (this file) reads the motion event's absolute
+	 * x/y fields for two things unrelated to the xrel/yrel-driven IKBD
+	 * motion: its "is the mouse trying to leave the window" edge
+	 * heuristic, and (with NFVDI_SUPPORT/fVDI active, as AFROS uses) an
+	 * absolute position it dispatches straight to fVDI. Leaving these at
+	 * SDL_zero()'s default 0 makes both misread every event as "mouse is
+	 * sitting in the top-left corner": the edge heuristic then treats
+	 * nearly any leftward/upward move as an exit attempt and ungrabs the
+	 * mouse (video->releaseTheMouse(), called from check_event()), after
+	 * which process_mouse_event()'s GrabbedMouse() gate silently drops
+	 * all further motion. web_drain_mouse_queue() fills them in from
+	 * here. */
+	s_web_mouse_x = sx;
+	s_web_mouse_y = sy;
+	web_queue_mouse_motion(xrel, yrel);
 }
 
 extern "C" {

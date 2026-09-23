@@ -190,14 +190,21 @@ The IKBD absolute mouse commands are not implemented in ARAnyM, so
 web_inject_abs_mouse_position() sends relative IKBD movement instead.
 
 While the mouse is moving, it sends the change since the previous call.
-Once no movement has been sent for 100ms, it sends the difference between
-the requested position and the guest's actual cursor position instead.
-This corrects any drift, for example from the guest cursor stopping at a
-screen edge. The guest's position is read from the line-A variables GCURX
-and GCURY, which EmuTOS reports at boot through NF_CONFIG.
+Once no movement has been sent for 100ms and the guest has read all
+queued movement, it sends the difference between the requested position
+and the guest's actual cursor position instead. This corrects any drift,
+for example from the guest cursor stopping at a screen edge. The guest's
+position is read from the line-A variables GCURX and GCURY, which EmuTOS
+reports at boot through NF_CONFIG.
 
 Comparing against the guest position on every call does not work: the
 guest position lags behind queued IKBD packets, so the cursor overshoots.
+
+Movement and button presses are queued and sent to the IKBD one packet
+at a time (at most 63 pixels per axis), each only once the guest has
+read the previous one. FreeMiNT with fVDI applies the second of two
+back-to-back mouse packets twice, so sending a large move as several
+packets at once makes the cursor overshoot.
 
 If the canvas size and ARAnyM's video size differ, a warning is written
 to stderr.

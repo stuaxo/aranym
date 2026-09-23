@@ -95,6 +95,8 @@ class IKBD: public ACIA {
 		void SendJoystickAxis(int numjoy, int numaxis, int value);
 		void SendJoystickHat(int numjoy, int value);
 		void SendJoystickButton(int numjoy, int pressed);
+		/* True when the guest has read everything queued for it */
+		bool IsInputBufferEmpty(void) const { return inread == inwrite; }
 };
 
 extern IKBD *ikbd;
